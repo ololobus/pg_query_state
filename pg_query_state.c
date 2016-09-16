@@ -8,21 +8,24 @@
  * IDENTIFICATION
  */
 
-#include "pg_query_state.h"
+#include <postgres.h>
 
 #include "access/htup_details.h"
 #include "catalog/pg_type.h"
+#include "commands/explain.h"
 #include "funcapi.h"
 #include "executor/execParallel.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/pg_list.h"
 #include "nodes/print.h"
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
 #include "storage/s_lock.h"
 #include "storage/spin.h"
+#include "storage/shm_mq.h"
 #include "storage/procarray.h"
 #include "storage/procsignal.h"
 #include "storage/shm_toc.h"
@@ -36,6 +39,12 @@ PG_MODULE_MAGIC;
 #define	PG_QS_MODULE_KEY	0xCA94B108
 #define	PG_QUERY_STATE_KEY	0
 #define	EXECUTOR_TRACE_KEY	1
+
+#define	QUEUE_SIZE			(16 * 1024)
+#define BASE_SIZEOF_SHM_MQ_MSG (offsetof(shm_mq_msg, stack_depth))
+
+#define TIMINIG_OFF_WARNING 1
+#define BUFFERS_OFF_WARNING 2
 
 #define TEXT_CSTR_CMP(text, cstr) \
 	(memcmp(VARDATA(text), (cstr), VARSIZE(text) - VARHDRSZ))
@@ -88,6 +97,41 @@ typedef struct
 } RemoteUserIdResult;
 
 /*
+ * Result status on query state request from asked backend
+ */
+typedef enum
+{
+	QUERY_NOT_RUNNING,		/* Backend doesn't execute any query */
+	STAT_DISABLED,			/* Collection of execution statistics is disabled */
+	QS_RETURNED				/* Backend succesfully returned its query state */
+} PG_QS_RequestResult;
+
+/*
+ *	Format of transmited data through message queue
+ */
+typedef struct
+{
+	int		length;							/* size of message record, for sanity check */
+	PGPROC	*proc;
+	PG_QS_RequestResult	result_code;
+	int		warnings;						/* bitmap of warnings */
+	int		stack_depth;
+	char	stack[FLEXIBLE_ARRAY_MEMBER];	/* sequencially laid out stack frames in form of
+												text records */
+} shm_mq_msg;
+
+/* pg_query_state arguments */
+typedef struct
+{
+	bool 	verbose;
+	bool	costs;
+	bool	timing;
+	bool	buffers;
+	bool	triggers;
+	ExplainFormat format;
+} pg_qs_params;
+
+/*
  * Kinds of trace commands
  */
 typedef enum
@@ -108,6 +152,7 @@ typedef struct
 
 static void SendCurrentUserId(void);
 static void SendBgWorkerPids(void);
+extern void SendQueryState(void);
 static Oid GetRemoteBackendUserId(PGPROC *proc);
 static List *GetRemoteBackendWorkers(PGPROC *proc);
 static List *GetRemoteBackendQueryStates(List *procs,
@@ -514,16 +559,16 @@ typedef struct
 {
 	text	*query;
 	text	*plan;
-} stack_frame;
+} stack_frame1;
 
 /*
- *	Convert serialized stack frame into stack_frame record
+ *	Convert serialized stack frame into stack_frame1 record
  *		Increment '*src' pointer to the next serialized stack frame
  */
-static stack_frame *
+static stack_frame1 *
 deserialize_stack_frame(char **src)
 {
-	stack_frame *result = palloc(sizeof(stack_frame));
+	stack_frame1 *result = palloc(sizeof(stack_frame1));
 	text		*query = (text *) *src,
 				*plan = (text *) (*src + INTALIGN(VARSIZE(query)));
 
@@ -537,7 +582,7 @@ deserialize_stack_frame(char **src)
 }
 
 /*
- * Convert serialized stack frames into List of stack_frame records
+ * Convert serialized stack frames into List of stack_frame1 records
  */
 static List *
 deserialize_stack(char *src, int stack_depth)
@@ -548,7 +593,7 @@ deserialize_stack(char *src, int stack_depth)
 
 	for (i = 0; i < stack_depth; i++)
 	{
-		stack_frame	*frame = deserialize_stack_frame(&curr_ptr);
+		stack_frame1	*frame = deserialize_stack_frame(&curr_ptr);
 		result = lappend(result, frame);
 	}
 
@@ -578,7 +623,6 @@ pg_query_state(PG_FUNCTION_ARGS)
 	} pg_qs_fctx;
 
 	FuncCallContext	*funcctx;
-	MemoryContext	oldcontext;
 	pg_qs_fctx		*fctx;
 	const int		N_ATTRS = 5;
 	pid_t			pid = PG_GETARG_INT32(0);
@@ -671,6 +715,7 @@ pg_query_state(PG_FUNCTION_ARGS)
 					TupleDesc	tupdesc;
 					ListCell	*i;
 					int64		max_calls = 0;
+					MemoryContext	oldcontext;
 
 					/* print warnings if exist */
 					if (msg->warnings & TIMINIG_OFF_WARNING)
@@ -733,7 +778,7 @@ pg_query_state(PG_FUNCTION_ARGS)
 		Datum		 values[N_ATTRS];
 		bool		 nulls[N_ATTRS];
 		proc_state	*p_state = (proc_state *) lfirst(fctx->proc_cursor);
-		stack_frame	*frame = (stack_frame *) lfirst(p_state->frame_cursor);
+		stack_frame1	*frame = (stack_frame1 *) lfirst(p_state->frame_cursor);
 
 		/* Make and return next tuple to caller */
 		MemSet(values, 0, sizeof(values));
@@ -1143,4 +1188,196 @@ GetRemoteBackendQueryStates(List *procs,
 signal_error:
 	ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 				errmsg("invalid send signal")));
+}
+
+/*
+ * Structure of stack frame of fucntion call which resulted from analyze of query state
+ */
+typedef struct
+{
+	const char	*query;
+	char		*plan;
+} stack_frame;
+
+/*
+ *	Get List of stack_frames as a stack of function calls starting from outermost call.
+ *		Each entry contains query text and query state in form of EXPLAIN ANALYZE output.
+ *	Assume extension is enabled and QueryDescStack is not empty
+ */
+static List *
+runtime_explain()
+{
+	ExplainState    *es;
+	ListCell	    *i;
+	List			*result = NIL;
+
+	Assert(list_length(QueryDescStack) > 0);
+
+	/* initialize explain state with all config parameters */
+	es = NewExplainState();
+	es->analyze = true;
+	es->verbose = params->verbose;
+	es->costs = params->costs;
+	es->buffers = params->buffers && pg_qs_buffers;
+	es->timing = params->timing && pg_qs_timing;
+	es->summary = false;
+	es->format = params->format;
+	es->runtime = true;
+
+	/* collect query state outputs of each plan entry of stack */
+	foreach(i, QueryDescStack)
+	{
+		QueryDesc 	*currentQueryDesc = (QueryDesc *) lfirst(i);
+		stack_frame	*qs_frame = palloc(sizeof(stack_frame));
+
+		/* save query text */
+		qs_frame->query = currentQueryDesc->sourceText;
+
+		/* save plan with statistics */
+		initStringInfo(es->str);
+		ExplainBeginOutput(es);
+		ExplainPrintPlan(es, currentQueryDesc);
+		if (params->triggers)
+			ExplainPrintTriggers(es, currentQueryDesc);
+		ExplainEndOutput(es);
+
+		/* Remove last line break */
+		if (es->str->len > 0 && es->str->data[es->str->len - 1] == '\n')
+			es->str->data[--es->str->len] = '\0';
+
+		/* Fix JSON to output an object */
+		if (params->format == EXPLAIN_FORMAT_JSON)
+		{
+			es->str->data[0] = '{';
+			es->str->data[es->str->len - 1] = '}';
+		}
+
+		qs_frame->plan = es->str->data;
+
+		result = lcons(qs_frame, result);
+	}
+
+	return result;
+}
+
+/*
+ * Compute length of serialized stack frame
+ */
+static int
+serialized_stack_frame_length(stack_frame *qs_frame)
+{
+	return 	INTALIGN(strlen(qs_frame->query) + VARHDRSZ)
+		+ 	INTALIGN(strlen(qs_frame->plan) + VARHDRSZ);
+}
+
+/*
+ * Compute overall length of serialized stack of function calls
+ */
+static int
+serialized_stack_length(List *qs_stack)
+{
+	ListCell 	*i;
+	int			result = 0;
+
+	foreach(i, qs_stack)
+	{
+		stack_frame *qs_frame = (stack_frame *) lfirst(i);
+
+		result += serialized_stack_frame_length(qs_frame);
+	}
+
+	return result;
+}
+
+/*
+ * Convert stack_frame record into serialized text format version
+ * 		Increment '*dest' pointer to the next serialized stack frame
+ */
+static void
+serialize_stack_frame(char **dest, stack_frame *qs_frame)
+{
+	SET_VARSIZE(*dest, strlen(qs_frame->query) + VARHDRSZ);
+	memcpy(VARDATA(*dest), qs_frame->query, strlen(qs_frame->query));
+	*dest += INTALIGN(VARSIZE(*dest));
+
+	SET_VARSIZE(*dest, strlen(qs_frame->plan) + VARHDRSZ);
+	memcpy(VARDATA(*dest), qs_frame->plan, strlen(qs_frame->plan));
+	*dest += INTALIGN(VARSIZE(*dest));
+}
+
+/*
+ * Convert List of stack_frame records into serialized structures laid out sequentially
+ */
+static void
+serialize_stack(char *dest, List *qs_stack)
+{
+	ListCell		*i;
+
+	foreach(i, qs_stack)
+	{
+		stack_frame *qs_frame = (stack_frame *) lfirst(i);
+
+		serialize_stack_frame(&dest, qs_frame);
+	}
+}
+
+/*
+ * Send state of current query to shared queue.
+ * This function is called when fire custom signal QueryStatePollReason
+ */
+void
+SendQueryState(void)
+{
+	shm_mq_handle 	*mqh;
+
+	/* wait until caller sets this process as sender to message queue */
+	for (;;)
+	{
+		if (shm_mq_get_sender(mq) == MyProc)
+			break;
+
+		WaitLatch(MyLatch, WL_LATCH_SET, 0);
+		CHECK_FOR_INTERRUPTS();
+		ResetLatch(MyLatch);
+	}
+
+	mqh = shm_mq_attach(mq, NULL, NULL);
+
+	/* check if module is enabled */
+	if (!pg_qs_enable)
+	{
+		shm_mq_msg msg = { BASE_SIZEOF_SHM_MQ_MSG, MyProc, STAT_DISABLED };
+
+		shm_mq_send(mqh, msg.length, &msg, false);
+	}
+
+	/* check if backend doesn't execute any query */
+	else if (list_length(QueryDescStack) == 0)
+	{
+		shm_mq_msg msg = { BASE_SIZEOF_SHM_MQ_MSG, MyProc, QUERY_NOT_RUNNING };
+
+		shm_mq_send(mqh, msg.length, &msg, false);
+	}
+
+	/* happy path */
+	else
+	{
+		List			*qs_stack = runtime_explain();
+		int				msglen = sizeof(shm_mq_msg) + serialized_stack_length(qs_stack);
+		shm_mq_msg		*msg = palloc(msglen);
+
+		msg->length = msglen;
+		msg->proc = MyProc;
+		msg->result_code = QS_RETURNED;
+
+		msg->warnings = 0;
+		if (params->timing && !pg_qs_timing)
+			msg->warnings |= TIMINIG_OFF_WARNING;
+		if (params->buffers && !pg_qs_buffers)
+			msg->warnings |= BUFFERS_OFF_WARNING;
+
+		msg->stack_depth = list_length(qs_stack);
+		serialize_stack(msg->stack, qs_stack);
+		shm_mq_send(mqh, msglen, msg, false);
+	}
 }
