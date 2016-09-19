@@ -75,10 +75,8 @@ static void qs_postExecProcNode(PlanState *planstate, TupleTableSlot *result);
 
 /* Global variables */
 List 					*QueryDescStack = NIL;
-static ProcSignalReason UserIdPollReason = INVALID_PROCSIGNAL;
-static ProcSignalReason QueryStatePollReason = INVALID_PROCSIGNAL;
-static ProcSignalReason WorkerPollReason = INVALID_PROCSIGNAL;
-static bool 			module_initialized = false;
+static ProcSignalReason  QueryStatePollReason = INVALID_PROCSIGNAL;
+static bool 			 module_initialized = false;
 static const char		*be_state_str[] = {						/* BackendState -> string repr */
 							"undefined",						/* STATE_UNDEFINED */
 							"idle",								/* STATE_IDLE */
@@ -101,35 +99,54 @@ typedef struct
  */
 typedef enum
 {
+	BACKEND_DIED,
 	QUERY_NOT_RUNNING,		/* Backend doesn't execute any query */
 	STAT_DISABLED,			/* Collection of execution statistics is disabled */
 	QS_RETURNED				/* Backend succesfully returned its query state */
-} PG_QS_RequestResult;
+} pgqsResultCode;
+
+/*
+ * Structure of stack frame of fucntion call which resulted from analyze of
+ * 	query state
+ */
+typedef struct
+{
+	const char	*query;
+	const char	*plan;
+} StackFrame;
+
+typedef struct
+{
+	PGPROC	*proc;
+	List	*frames;
+} ProcState;
 
 /*
  *	Format of transmited data through message queue
  */
-typedef struct
-{
-	int		length;							/* size of message record, for sanity check */
-	PGPROC	*proc;
-	PG_QS_RequestResult	result_code;
-	int		warnings;						/* bitmap of warnings */
-	int		stack_depth;
-	char	stack[FLEXIBLE_ARRAY_MEMBER];	/* sequencially laid out stack frames in form of
-												text records */
-} shm_mq_msg;
+/* typedef struct */
+/* { */
+	/* int		length;							 *//* size of message record, for */
+											   /* sanity check */
+	/* PGPROC	*proc; */
+	/* pgqsResultCode	result_code; */
+	/* int		warnings;						[> bitmap of warnings <] */
+	/* int		stack_depth; */
+	/* char	stack[FLEXIBLE_ARRAY_MEMBER];	 *//* sequencially laid out stack */
+											   /* frames in form of text records */
+/* } shm_mq_msg; */
 
 /* pg_query_state arguments */
 typedef struct
 {
+	Oid		userid;
 	bool 	verbose;
 	bool	costs;
 	bool	timing;
 	bool	buffers;
 	bool	triggers;
 	ExplainFormat format;
-} pg_qs_params;
+} pgqsParameters;
 
 /*
  * Kinds of trace commands
@@ -150,23 +167,20 @@ typedef struct
 	pid_t 		traceable;
 } trace_request;
 
-static void SendCurrentUserId(void);
-static void SendBgWorkerPids(void);
 extern void SendQueryState(void);
-static Oid GetRemoteBackendUserId(PGPROC *proc);
-static List *GetRemoteBackendWorkers(PGPROC *proc);
-static List *GetRemoteBackendQueryStates(List *procs,
-										 bool verbose,
-										 bool costs,
-										 bool timing,
-										 bool buffers,
-										 bool triggers,
-										 ExplainFormat format);
+static pgqsResultCode GetRemoteBackendQueryState(PGPROC *proc,
+												 bool verbose,
+												 bool costs,
+												 bool timing,
+												 bool buffers,
+												 bool triggers,
+												 ExplainFormat format,
+												 List **result,
+												 int *warnings);
 
 /* Shared memory variables */
 shm_toc			*toc = NULL;
-RemoteUserIdResult *counterpart_userid = NULL;
-pg_qs_params   	*params = NULL;
+pgqsParameters	*params = NULL;
 trace_request	*trace_req = NULL;
 shm_mq 			*mq = NULL;
 
@@ -182,11 +196,10 @@ pg_qs_shmem_size()
 
 	shm_toc_initialize_estimator(&e);
 
-	nkeys = 4;
+	nkeys = 3;
 
-	shm_toc_estimate_chunk(&e, sizeof(RemoteUserIdResult));
 	shm_toc_estimate_chunk(&e, sizeof(trace_request));
-	shm_toc_estimate_chunk(&e, sizeof(pg_qs_params));
+	shm_toc_estimate_chunk(&e, sizeof(pgqsParameters));
 	shm_toc_estimate_chunk(&e, (Size) QUEUE_SIZE);
 
 	shm_toc_estimate_keys(&e, nkeys);
@@ -211,11 +224,7 @@ pg_qs_shmem_startup(void)
 	{
 		toc = shm_toc_create(PG_QS_MODULE_KEY, shmem, shmem_size);
 
-		counterpart_userid = shm_toc_allocate(toc, sizeof(RemoteUserIdResult));
-		shm_toc_insert(toc, num_toc++, counterpart_userid);
-		SpinLockInit(&counterpart_userid->mutex);
-
-		params = shm_toc_allocate(toc, sizeof(pg_qs_params));
+		params = shm_toc_allocate(toc, sizeof(pgqsParameters));
 		shm_toc_insert(toc, num_toc++, params);
 
 		trace_req = shm_toc_allocate(toc, sizeof(trace_request));
@@ -229,7 +238,6 @@ pg_qs_shmem_startup(void)
 	{
 		toc = shm_toc_attach(PG_QS_MODULE_KEY, shmem);
 
-		counterpart_userid = shm_toc_lookup(toc, num_toc++);
 		params = shm_toc_lookup(toc, num_toc++);
 		trace_req = shm_toc_lookup(toc, num_toc++);
 		mq = shm_toc_lookup(toc, num_toc++);
@@ -258,12 +266,8 @@ _PG_init(void)
 	RequestAddinShmemSpace(pg_qs_shmem_size());
 
 	/* Register interrupt on custom signal of polling query state */
-	UserIdPollReason = RegisterCustomProcSignalHandler(SendCurrentUserId);
 	QueryStatePollReason = RegisterCustomProcSignalHandler(SendQueryState);
-	WorkerPollReason = RegisterCustomProcSignalHandler(SendBgWorkerPids);
-	if (QueryStatePollReason == INVALID_PROCSIGNAL
-		|| WorkerPollReason == INVALID_PROCSIGNAL
-		|| UserIdPollReason == INVALID_PROCSIGNAL)
+	if (QueryStatePollReason == INVALID_PROCSIGNAL)
 	{
 		ereport(WARNING, (errcode(ERRCODE_INSUFFICIENT_RESOURCES),
 					errmsg("pg_query_state isn't loaded: insufficient custom ProcSignal slots")));
@@ -607,24 +611,18 @@ PG_FUNCTION_INFO_V1(pg_query_state);
 Datum
 pg_query_state(PG_FUNCTION_ARGS)
 {
-	typedef struct
-	{
-		PGPROC 		*proc;
-		ListCell 	*frame_cursor;
-		int			 frame_index;
-		List		*stack;
-	} proc_state;
-
 	/* multicall context type */
 	typedef struct
 	{
 		ListCell	*proc_cursor;
-		List		*procs;
-	} pg_qs_fctx;
+		ListCell 	*frame_cursor;
+		int			 frame_index;
+		List		*ProcState;
+	} pgqsFuncCtx;
 
 	FuncCallContext	*funcctx;
-	pg_qs_fctx		*fctx;
-	const int		N_ATTRS = 5;
+	/* pgqsFuncCtx		*fctx; */
+	/* const int		N_ATTRS = 5; */
 	pid_t			pid = PG_GETARG_INT32(0);
 
 	if (SRF_IS_FIRSTCALL())
@@ -638,23 +636,19 @@ pg_query_state(PG_FUNCTION_ARGS)
 		text			*format_text = PG_GETARG_TEXT_P(6);
 		ExplainFormat	 format;
 		PGPROC			*proc;
-		Oid				 counterpart_user_id;
-		shm_mq_msg		*msg;
-		List			*bg_worker_procs = NIL;
-		List			*msgs;
+		pgqsResultCode	 result_code;
+		List			*proc_states;
+		int				 warnings;
 
 		if (!module_initialized)
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("pg_query_state wasn't initialized yet")));
+			goto module_not_initilized;
 
 		if (pid == MyProcPid)
-			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							errmsg("attempt to extract state of current process")));
+			goto address_to_current_process;
 
 		proc = BackendPidGetProc(pid);
 		if (!proc || proc->backendId == InvalidBackendId)
-			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							errmsg("backend with pid=%d not found", pid)));
+			goto invalid_backend;
 
 		if (TEXT_CSTR_CMP(format_text, "text") == 0)
 			format = EXPLAIN_FORMAT_TEXT;
@@ -665,145 +659,159 @@ pg_query_state(PG_FUNCTION_ARGS)
 		else if (TEXT_CSTR_CMP(format_text, "yaml") == 0)
 			format = EXPLAIN_FORMAT_YAML;
 		else
-			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							errmsg("unrecognized 'format' argument")));
+			goto unrecognized_format;
+
 		/*
-		 * init and acquire lock so that any other concurrent calls of this fuction
-		 * can not occupy shared queue for transfering query state
+		 * init and acquire lock that protects from concurrent access to shared
+		 * memory intended for query state transmission
 		 */
 		init_lock_tag(&tag, PG_QUERY_STATE_KEY);
 		LockAcquire(&tag, ExclusiveLock, false, false);
 
-		counterpart_user_id = GetRemoteBackendUserId(proc);
-		if (!(superuser() || GetUserId() == counterpart_user_id))
-			ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-							errmsg("permission denied")));
+		/* if (!(superuser() || GetUserId() == counterpart_user_id)) */
+			/* ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), */
+							/* errmsg("permission denied"))); */
 
-		bg_worker_procs = GetRemoteBackendWorkers(proc);
-
-		msgs = GetRemoteBackendQueryStates(lcons(proc, bg_worker_procs),
-										   verbose,
-										   costs,
-										   timing,
-										   buffers,
-										   triggers,
-										   format);
-		msg = (shm_mq_msg *) linitial(msgs);
+		result_code = GetRemoteBackendQueryState(proc,
+												 verbose,
+												 costs,
+												 timing,
+												 buffers,
+												 triggers,
+												 format,
+												 &proc_states,
+												 &warnings);
+		/* msg = (shm_mq_msg *) linitial(msgs); */
 
 		funcctx = SRF_FIRSTCALL_INIT();
-		switch (msg->result_code)
-		{
-			case QUERY_NOT_RUNNING:
-				{
-					PgBackendStatus	*be_status = search_be_status(pid);
+		/* switch (msg->result_code) */
+		/* { */
+			/* case QUERY_NOT_RUNNING: */
+				/* { */
+					/* PgBackendStatus	*be_status = search_be_status(pid); */
 
-					if (be_status)
-						elog(INFO, "state of backend is %s",
-								be_state_str[be_status->st_state - STATE_UNDEFINED]);
-					else
-						elog(INFO, "backend is not running query");
+					/* if (be_status) */
+						/* elog(INFO, "state of backend is %s", */
+								/* be_state_str[be_status->st_state - STATE_UNDEFINED]); */
+					/* else */
+						/* elog(INFO, "backend is not running query"); */
 
-					LockRelease(&tag, ExclusiveLock, false);
-					SRF_RETURN_DONE(funcctx);
-				}
-			case STAT_DISABLED:
-				elog(INFO, "query execution statistics disabled");
-				LockRelease(&tag, ExclusiveLock, false);
-				SRF_RETURN_DONE(funcctx);
-			case QS_RETURNED:
-				{
-					TupleDesc	tupdesc;
-					ListCell	*i;
-					int64		max_calls = 0;
-					MemoryContext	oldcontext;
+					/* LockRelease(&tag, ExclusiveLock, false); */
+					/* SRF_RETURN_DONE(funcctx); */
+				/* } */
+			/* case STAT_DISABLED: */
+				/* elog(INFO, "query execution statistics disabled"); */
+				/* LockRelease(&tag, ExclusiveLock, false); */
+				/* SRF_RETURN_DONE(funcctx); */
+			/* default: */
+				/* break; */
+		/* } */
 
-					/* print warnings if exist */
-					if (msg->warnings & TIMINIG_OFF_WARNING)
-						ereport(WARNING, (errcode(ERRCODE_WARNING),
-										errmsg("timing statistics disabled")));
-					if (msg->warnings & BUFFERS_OFF_WARNING)
-						ereport(WARNING, (errcode(ERRCODE_WARNING),
-										errmsg("buffers statistics disabled")));
-
-					oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-
-					/* save stack of calls and current cursor in multicall context */
-					fctx = (pg_qs_fctx *) palloc(sizeof(pg_qs_fctx));
-					fctx->procs = NIL;
-					foreach(i, msgs)
-					{
-						List 		*qs_stack;
-						shm_mq_msg	*msg = (shm_mq_msg *) lfirst(i);
-						proc_state	*p_state = (proc_state *) palloc(sizeof(proc_state));
-
-						qs_stack = deserialize_stack(msg->stack, msg->stack_depth);
-
-						p_state->proc = msg->proc;
-						p_state->stack = qs_stack;
-						p_state->frame_index = 0;
-						p_state->frame_cursor = list_head(qs_stack);
-
-						fctx->procs = lappend(fctx->procs, p_state);
-
-						max_calls += list_length(qs_stack);
-					}
-					fctx->proc_cursor = list_head(fctx->procs);
-
-					funcctx->user_fctx = fctx;
-					funcctx->max_calls = max_calls;
-
-					/* Make tuple descriptor */
-					tupdesc = CreateTemplateTupleDesc(N_ATTRS, false);
-					TupleDescInitEntry(tupdesc, (AttrNumber) 1, "pid", INT4OID, -1, 0);
-					TupleDescInitEntry(tupdesc, (AttrNumber) 2, "frame_number", INT4OID, -1, 0);
-					TupleDescInitEntry(tupdesc, (AttrNumber) 3, "query_text", TEXTOID, -1, 0);
-					TupleDescInitEntry(tupdesc, (AttrNumber) 4, "plan", TEXTOID, -1, 0);
-					TupleDescInitEntry(tupdesc, (AttrNumber) 5, "leader_pid", INT4OID, -1, 0);
-					funcctx->tuple_desc = BlessTupleDesc(tupdesc);
-
-					LockRelease(&tag, ExclusiveLock, false);
-					MemoryContextSwitchTo(oldcontext);
-				}
-				break;
-		}
-	}
-
-	/* restore function multicall context */
-	funcctx = SRF_PERCALL_SETUP();
-	fctx = funcctx->user_fctx;
-
-	if (funcctx->call_cntr < funcctx->max_calls)
-	{
-		HeapTuple 	 tuple;
-		Datum		 values[N_ATTRS];
-		bool		 nulls[N_ATTRS];
-		proc_state	*p_state = (proc_state *) lfirst(fctx->proc_cursor);
-		stack_frame1	*frame = (stack_frame1 *) lfirst(p_state->frame_cursor);
-
-		/* Make and return next tuple to caller */
-		MemSet(values, 0, sizeof(values));
-		MemSet(nulls, 0, sizeof(nulls));
-		values[0] = Int32GetDatum(p_state->proc->pid);
-		values[1] = Int32GetDatum(p_state->frame_index);
-		values[2] = PointerGetDatum(frame->query);
-		values[3] = PointerGetDatum(frame->plan);
-		if (p_state->proc->pid == pid)
-			nulls[4] = true;
-		else
-			values[4] = Int32GetDatum(pid);
-		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
-
-		/* increment cursor */
-		p_state->frame_cursor = lnext(p_state->frame_cursor);
-		p_state->frame_index++;
-
-		if (p_state->frame_cursor == NULL)
-			fctx->proc_cursor = lnext(fctx->proc_cursor);
-
-		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
-	}
-	else
 		SRF_RETURN_DONE(funcctx);
+
+		/* TupleDesc	tupdesc; */
+		/* ListCell	*i; */
+		/* int64		max_calls = 0; */
+		/* MemoryContext	oldcontext; */
+
+		/* [> print warnings if exist <] */
+		/* if (msg->warnings & TIMINIG_OFF_WARNING) */
+			/* ereport(WARNING, (errcode(ERRCODE_WARNING), */
+						/* errmsg("timing statistics disabled"))); */
+		/* if (msg->warnings & BUFFERS_OFF_WARNING) */
+			/* ereport(WARNING, (errcode(ERRCODE_WARNING), */
+						/* errmsg("buffers statistics disabled"))); */
+
+		/* oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx); */
+
+		/* [> save stack of calls and current cursor in multicall context <] */
+		/* fctx = (pgqsFuncCtx *) palloc(sizeof(pgqsFuncCtx)); */
+		/* fctx->procs = NIL; */
+		/* foreach(i, msgs) */
+		/* { */
+			/* List 		*qs_stack; */
+			/* shm_mq_msg	*msg = (shm_mq_msg *) lfirst(i); */
+			/* ProcCtx	*p_state = (ProcCtx *) palloc(sizeof(ProcCtx)); */
+
+			/* qs_stack = deserialize_stack(msg->stack, msg->stack_depth); */
+
+			/* p_state->proc = msg->proc; */
+			/* p_state->stack = qs_stack; */
+			/* p_state->frame_index = 0; */
+			/* p_state->frame_cursor = list_head(qs_stack); */
+
+			/* fctx->procs = lappend(fctx->procs, p_state); */
+
+			/* max_calls += list_length(qs_stack); */
+		/* } */
+		/* fctx->proc_cursor = list_head(fctx->procs); */
+
+		/* funcctx->user_fctx = fctx; */
+		/* funcctx->max_calls = max_calls; */
+
+		/* [> Make tuple descriptor <] */
+		/* tupdesc = CreateTemplateTupleDesc(N_ATTRS, false); */
+		/* TupleDescInitEntry(tupdesc, (AttrNumber) 1, "pid", INT4OID, -1, 0); */
+		/* TupleDescInitEntry(tupdesc, (AttrNumber) 2, "frame_number", INT4OID, -1, 0); */
+		/* TupleDescInitEntry(tupdesc, (AttrNumber) 3, "query_text", TEXTOID, -1, 0); */
+		/* TupleDescInitEntry(tupdesc, (AttrNumber) 4, "plan", TEXTOID, -1, 0); */
+		/* TupleDescInitEntry(tupdesc, (AttrNumber) 5, "leader_pid", INT4OID, -1, 0); */
+		/* funcctx->tuple_desc = BlessTupleDesc(tupdesc); */
+
+		/* LockRelease(&tag, ExclusiveLock, false); */
+		/* MemoryContextSwitchTo(oldcontext); */
+	/* } */
+
+	/* [> restore function multicall context <] */
+	/* funcctx = SRF_PERCALL_SETUP(); */
+	/* fctx = funcctx->user_fctx; */
+
+	/* if (funcctx->call_cntr < funcctx->max_calls) */
+	/* { */
+		/* HeapTuple 	 tuple; */
+		/* Datum		 values[N_ATTRS]; */
+		/* bool		 nulls[N_ATTRS]; */
+		/* ProcCtx	*p_state = (ProcCtx *) lfirst(fctx->proc_cursor); */
+		/* stack_frame1	*frame = (stack_frame1 *) lfirst(p_state->frame_cursor); */
+
+		/* [> Make and return next tuple to caller <] */
+		/* MemSet(values, 0, sizeof(values)); */
+		/* MemSet(nulls, 0, sizeof(nulls)); */
+		/* values[0] = Int32GetDatum(p_state->proc->pid); */
+		/* values[1] = Int32GetDatum(p_state->frame_index); */
+		/* values[2] = PointerGetDatum(frame->query); */
+		/* values[3] = PointerGetDatum(frame->plan); */
+		/* if (p_state->proc->pid == pid) */
+			/* nulls[4] = true; */
+		/* else */
+			/* values[4] = Int32GetDatum(pid); */
+		/* tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls); */
+
+		/* [> increment cursor <] */
+		/* p_state->frame_cursor = lnext(p_state->frame_cursor); */
+		/* p_state->frame_index++; */
+
+		/* if (p_state->frame_cursor == NULL) */
+			/* fctx->proc_cursor = lnext(fctx->proc_cursor); */
+
+		/* SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple)); */
+	}
+	/* else */
+	funcctx = SRF_PERCALL_SETUP();
+	SRF_RETURN_DONE(funcctx);
+
+module_not_initilized:
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("pg_query_state wasn't initialized yet")));
+address_to_current_process:
+	ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("attempt to extract state of current process")));
+invalid_backend:
+	ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("backend with pid=%d not found", pid)));
+unrecognized_format:
+	ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("unrecognized 'format' argument")));
 }
 
 /*
@@ -882,15 +890,15 @@ executor_continue(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-static void
-SendCurrentUserId(void)
-{
-	SpinLockAcquire(&counterpart_userid->mutex);
-	counterpart_userid->userid = GetUserId();
-	SpinLockRelease(&counterpart_userid->mutex);
+/* static void */
+/* SendCurrentUserId(void) */
+/* { */
+	/* SpinLockAcquire(&counterpart_userid->mutex); */
+	/* counterpart_userid->userid = GetUserId(); */
+	/* SpinLockRelease(&counterpart_userid->mutex); */
 
-	SetLatch(counterpart_userid->caller);
-}
+	/* SetLatch(counterpart_userid->caller); */
+/* } */
 
 /*
  * Extract effective user id from backend on which `proc` points.
@@ -900,36 +908,36 @@ SendCurrentUserId(void)
  * This fuction must be called after registeration of `UserIdPollReason` and
  * initialization `RemoteUserIdResult` object in shared memory.
  */
-static Oid
-GetRemoteBackendUserId(PGPROC *proc)
-{
-	Oid result;
+/* static Oid */
+/* GetRemoteBackendUserId(PGPROC *proc) */
+/* { */
+	/* Oid result; */
 
-	Assert(proc && proc->backendId != InvalidBackendId);
-	Assert(UserIdPollReason != INVALID_PROCSIGNAL);
-	Assert(counterpart_userid);
+	/* Assert(proc && proc->backendId != InvalidBackendId); */
+	/* Assert(UserIdPollReason != INVALID_PROCSIGNAL); */
+	/* Assert(counterpart_userid); */
 
-	counterpart_userid->userid = InvalidOid;
-	counterpart_userid->caller = MyLatch;
-	pg_write_barrier();
+	/* counterpart_userid->userid = InvalidOid; */
+	/* counterpart_userid->caller = MyLatch; */
+	/* pg_write_barrier(); */
 
-	SendProcSignal(proc->pid, UserIdPollReason, proc->backendId);
-	for (;;)
-	{
-		SpinLockAcquire(&counterpart_userid->mutex);
-		result = counterpart_userid->userid;
-		SpinLockRelease(&counterpart_userid->mutex);
+	/* SendProcSignal(proc->pid, UserIdPollReason, proc->backendId); */
+	/* for (;;) */
+	/* { */
+		/* SpinLockAcquire(&counterpart_userid->mutex); */
+		/* result = counterpart_userid->userid; */
+		/* SpinLockRelease(&counterpart_userid->mutex); */
 
-		if (result != InvalidOid)
-			break;
+		/* if (result != InvalidOid) */
+			/* break; */
 
-		WaitLatch(MyLatch, WL_LATCH_SET, 0);
-		CHECK_FOR_INTERRUPTS();
-		ResetLatch(MyLatch);
-	}
+		/* WaitLatch(MyLatch, WL_LATCH_SET, 0); */
+		/* CHECK_FOR_INTERRUPTS(); */
+		/* ResetLatch(MyLatch); */
+	/* } */
 
-	return result;
-}
+	/* return result; */
+/* } */
 
 /*
  * Receive a message from a shared message queue until timeout is exceeded.
@@ -973,150 +981,131 @@ shm_mq_receive_with_timeout(shm_mq_handle *mqh,
 	}
 }
 
-/*
- * Extract to *result pids of all parallel workers running from leader process
- * that executes plan tree whose state root is `node`.
- */
-static bool
-extract_running_bgworkers(PlanState *node, List **result)
-{
-	if (node == NULL)
-		return false;
+/* typedef struct */
+/* { */
+	/* int		number; */
+	/* pid_t	pids[FLEXIBLE_ARRAY_MEMBER]; */
+/* } BgWorkerPids; */
 
-	if (IsA(node, GatherState))
-	{
-		GatherState *gather_node = (GatherState *) node;
-		int 		i;
+/* static void */
+/* SendBgWorkerPids(void) */
+/* { */
+	/* ListCell 		*iter; */
+	/* List 			*all_workers = NIL; */
+	/* BgWorkerPids 	*msg; */
+	/* int				 msg_len; */
+	/* int				 i; */
+	/* shm_mq_handle 	*mqh; */
 
-		if (gather_node->pei)
-		{
-			for (i = 0; i < gather_node->pei->pcxt->nworkers_launched; i++)
-			{
-				pid_t 					 pid;
-				BackgroundWorkerHandle 	*bgwh;
-				BgwHandleStatus 		 status;
+	/* mqh = shm_mq_attach(mq, NULL, NULL); */
 
-				bgwh = gather_node->pei->pcxt->worker[i].bgwhandle;
-				if (!bgwh)
-					continue;
+	/* foreach(iter, QueryDescStack) */
+	/* { */
+		/* QueryDesc	*curQueryDesc = (QueryDesc *) lfirst(iter); */
+		/* List 		*bgworker_pids = NIL; */
 
-				status = GetBackgroundWorkerPid(bgwh, &pid);
-				if (status == BGWH_STARTED)
-					*result = lcons_int(pid, *result);
-			}
-		}
-	}
-	return planstate_tree_walker(node, extract_running_bgworkers, (void *) result);
-}
+		/* extract_running_bgworkers(curQueryDesc->planstate, &bgworker_pids); */
+		/* all_workers = list_concat(all_workers, bgworker_pids); */
+	/* } */
 
-typedef struct
-{
-	int		number;
-	pid_t	pids[FLEXIBLE_ARRAY_MEMBER];
-} BgWorkerPids;
+	/* msg_len = offsetof(BgWorkerPids, pids) */
+			/* + sizeof(pid_t) * list_length(all_workers); */
+	/* msg = palloc(msg_len); */
+	/* msg->number = list_length(all_workers); */
+	/* i = 0; */
+	/* foreach(iter, all_workers) */
+		/* msg->pids[i++] = lfirst_int(iter); */
 
-static void
-SendBgWorkerPids(void)
-{
-	ListCell 		*iter;
-	List 			*all_workers = NIL;
-	BgWorkerPids 	*msg;
-	int				 msg_len;
-	int				 i;
-	shm_mq_handle 	*mqh;
-
-	mqh = shm_mq_attach(mq, NULL, NULL);
-
-	foreach(iter, QueryDescStack)
-	{
-		QueryDesc	*curQueryDesc = (QueryDesc *) lfirst(iter);
-		List 		*bgworker_pids = NIL;
-
-		extract_running_bgworkers(curQueryDesc->planstate, &bgworker_pids);
-		all_workers = list_concat(all_workers, bgworker_pids);
-	}
-
-	msg_len = offsetof(BgWorkerPids, pids)
-			+ sizeof(pid_t) * list_length(all_workers);
-	msg = palloc(msg_len);
-	msg->number = list_length(all_workers);
-	i = 0;
-	foreach(iter, all_workers)
-		msg->pids[i++] = lfirst_int(iter);
-
-	shm_mq_send(mqh, msg_len, msg, false);
-}
+	/* shm_mq_send(mqh, msg_len, msg, false); */
+/* } */
 
 /*
  * Extracts all parallel worker `proc`s running by process `proc`
  */
-static List *
-GetRemoteBackendWorkers(PGPROC *proc)
+/* static List * */
+/* GetRemoteBackendWorkers(PGPROC *proc) */
+/* { */
+	/* int				 sig_result; */
+	/* shm_mq_handle	*mqh; */
+	/* shm_mq_result 	 mq_receive_result; */
+	/* BgWorkerPids	*msg; */
+	/* Size			 msg_len; */
+	/* int				 i; */
+	/* List			*result = NIL; */
+
+	/* Assert(proc && proc->backendId != InvalidBackendId); */
+	/* Assert(WorkerPollReason != INVALID_PROCSIGNAL); */
+	/* Assert(mq); */
+
+	/* mq = shm_mq_create(mq, QUEUE_SIZE); */
+	/* shm_mq_set_sender(mq, proc); */
+	/* shm_mq_set_receiver(mq, MyProc); */
+
+	/* sig_result = SendProcSignal(proc->pid, WorkerPollReason, proc->backendId); */
+	/* if (sig_result == -1) */
+		/* return NIL; */
+
+	/* mqh = shm_mq_attach(mq, NULL, NULL); */
+	/* mq_receive_result = shm_mq_receive_with_timeout(mqh, &msg_len, (void **) &msg, 1000); */
+	/* if (mq_receive_result != SHM_MQ_SUCCESS) */
+		/* return NIL; */
+
+	/* for (i = 0; i < msg->number; i++) */
+	/* { */
+		/* pid_t 	 pid = msg->pids[i]; */
+		/* PGPROC	*proc = BackendPidGetProc(pid); */
+
+		/* result = lcons(proc, result); */
+	/* } */
+
+	/* shm_mq_detach(mq); */
+
+	/* return result; */
+/* } */
+
+/* static shm_mq_msg * */
+/* copy_msg(shm_mq_msg *msg) */
+/* { */
+	/* shm_mq_msg *result = palloc(msg->length); */
+
+	/* memcpy(result, msg, msg->length); */
+	/* return result; */
+/* } */
+
+typedef struct
 {
-	int				 sig_result;
-	shm_mq_handle	*mqh;
-	shm_mq_result 	 mq_receive_result;
-	BgWorkerPids	*msg;
-	Size			 msg_len;
-	int				 i;
-	List			*result = NIL;
+	pgqsResultCode result;
+	int		 warnings;				/* bitmap of warnings */
+	int		 npworkers;
+	PGPROC	*pworkers[FLEXIBLE_ARRAY_MEMBER];
+} pgqsPreambleMsg;
 
-	Assert(proc && proc->backendId != InvalidBackendId);
-	Assert(WorkerPollReason != INVALID_PROCSIGNAL);
-	Assert(mq);
-
-	mq = shm_mq_create(mq, QUEUE_SIZE);
-	shm_mq_set_sender(mq, proc);
-	shm_mq_set_receiver(mq, MyProc);
-
-	sig_result = SendProcSignal(proc->pid, WorkerPollReason, proc->backendId);
-	if (sig_result == -1)
-		return NIL;
-
-	mqh = shm_mq_attach(mq, NULL, NULL);
-	mq_receive_result = shm_mq_receive_with_timeout(mqh, &msg_len, (void **) &msg, 1000);
-	if (mq_receive_result != SHM_MQ_SUCCESS)
-		return NIL;
-
-	for (i = 0; i < msg->number; i++)
-	{
-		pid_t 	 pid = msg->pids[i];
-		PGPROC	*proc = BackendPidGetProc(pid);
-
-		result = lcons(proc, result);
-	}
-
-	shm_mq_detach(mq);
-
-	return result;
-}
-
-static shm_mq_msg *
-copy_msg(shm_mq_msg *msg)
+typedef struct
 {
-	shm_mq_msg *result = palloc(msg->length);
+	Size	 length;
+	int		 nframes;
+	char	 stack[FLEXIBLE_ARRAY_MEMBER];
+} pgqsStackMsg;
 
-	memcpy(result, msg, msg->length);
-	return result;
-}
-
-static List *
-GetRemoteBackendQueryStates(List *procs,
-						    bool verbose,
-						    bool costs,
-						    bool timing,
-						    bool buffers,
-						    bool triggers,
-						    ExplainFormat format)
+static pgqsResultCode
+GetRemoteBackendQueryState(PGPROC *proc,
+						   bool verbose,
+						   bool costs,
+						   bool timing,
+						   bool buffers,
+						   bool triggers,
+						   ExplainFormat format,
+						   List	**result,
+						   int *warnings)
 {
-	List			*result = NIL;
-	List			*alive_procs = NIL;
-	ListCell		*iter;
+	List		*procs;
+	int		 	 sig_result;
 
 	Assert(QueryStatePollReason != INVALID_PROCSIGNAL);
 	Assert(mq);
 
-	/* fill in parameters of query state request */
+	/* fill in parameters for query state request */
+	params->userid = GetUserId();
 	params->verbose = verbose;
 	params->costs = costs;
 	params->timing = timing;
@@ -1125,43 +1114,33 @@ GetRemoteBackendQueryStates(List *procs,
 	params->format = format;
 	pg_write_barrier();
 
-	/*
-	 * send signal `QueryStatePollReason` to all processes and define all alive
-	 * 		ones
-	 */
-	foreach(iter, procs)
+	/* send signal `QueryStatePollReason` to `proc` */
+	sig_result = SendProcSignal(proc->pid,
+								QueryStatePollReason,
+								proc->backendId);
+	if (sig_result == -1)
 	{
-		PGPROC 	*proc = (PGPROC *) lfirst(iter);
-		int		 sig_result;
-
-		sig_result = SendProcSignal(proc->pid,
-									QueryStatePollReason,
-									proc->backendId);
-		if (sig_result == -1)
-		{
-			if (errno != ESRCH)
-				goto signal_error;
-			continue;
-		}
-
-		alive_procs = lappend(alive_procs, proc);
+		if (errno == ESRCH)
+			return BACKEND_DIED;
+		goto signal_error;
 	}
 
-	/*
-	 * collect results from all alived processes
-	 */
-	foreach(iter, alive_procs)
+	procs = list_make1(proc);
+	while (list_length(procs) > 0)
 	{
-		PGPROC 			*proc = (PGPROC *) lfirst(iter);
+		PGPROC 			*cur_proc = (PGPROC *) linitial(procs);
 		shm_mq_handle  	*mqh;
 		shm_mq_result	 mq_receive_result;
-		shm_mq_msg		*msg;
+		pgqsPreambleMsg	*preamble;
+		pgqsStackMsg	*stack_msg;
 		Size			 len;
+		int				 i;
+		ProcState		*proc_state;
+		StackFrame		*qs_stack;
 
-		/* prepare message queue to transfer data */
 		mq = shm_mq_create(mq, QUEUE_SIZE);
 		shm_mq_set_sender(mq, proc);
-		shm_mq_set_receiver(mq, MyProc);	/* this function notifies the
+		shm_mq_set_receiver(mq, MyProc); 	/* this function notifies the
 											   counterpart to come into data
 											   transfer */
 
@@ -1169,21 +1148,68 @@ GetRemoteBackendQueryStates(List *procs,
 		mqh = shm_mq_attach(mq, NULL, NULL);
 		mq_receive_result = shm_mq_receive_with_timeout(mqh,
 														&len,
-														(void **) &msg,
+														(void **) &preamble,
 														5000);
 		if (mq_receive_result != SHM_MQ_SUCCESS)
-			/* counterpart is died, not consider it */
 			continue;
 
-		Assert(len == msg->length);
+		if (cur_proc == proc && preamble->result != QS_RETURNED)
+			return preamble->result;
 
-		/* aggregate result data */
-		result = lappend(result, copy_msg(msg));
+		*warnings = preamble->warnings;
+		for (i = 0; i < preamble->npworkers; i++)
+			procs = lappend(procs, preamble->pworkers[i]);
 
-		shm_mq_detach(mq);
+		mq_receive_result = shm_mq_receive(mqh,
+										   &len,
+										   (void **) &stack_msg,
+										   false);
+		Assert(mq_receive_result == SHM_MQ_SUCCESS);
+		Assert(stack_msg->length == len);
+
+		proc_state = palloc(sizeof(ProcState));
+		proc_state->proc = cur_proc;
+		proc_state->frames = deserialize_stack(stack_msg->stack,
+											   stack_msg->length);
+		*result = lappend(*result, proc_state);
+
+		procs = list_delete_first(procs);
 	}
 
-	return result;
+
+	/*
+	 * collect results from all alived processes
+	 */
+	/* foreach(iter, alive_procs) */
+	/* { */
+		/* PGPROC 			*proc = (PGPROC *) lfirst(iter); */
+
+		/* [> prepare message queue to transfer data <] */
+		/* mq = shm_mq_create(mq, QUEUE_SIZE); */
+		/* shm_mq_set_sender(mq, proc); */
+		/* shm_mq_set_receiver(mq, MyProc); */	/* this function notifies the */
+											   /* counterpart to come into data */
+											   /* transfer */
+
+		/* [> retrieve result data from message queue <] */
+		/* mqh = shm_mq_attach(mq, NULL, NULL); */
+		/* mq_receive_result = shm_mq_receive_with_timeout(mqh, */
+														/* &len, */
+														/* (void **) &msg, */
+														/* 5000); */
+		/* if (mq_receive_result != SHM_MQ_SUCCESS) */
+			/* [> counterpart is died, not consider it <] */
+			/* continue; */
+
+		/* Assert(len == msg->length); */
+
+		/* [> aggregate result data <] */
+		/* result = lappend(result, copy_msg(msg)); */
+
+		/* shm_mq_detach(mq); */
+	/* } */
+
+	return QS_RETURNED;
 
 signal_error:
 	ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
@@ -1191,17 +1217,10 @@ signal_error:
 }
 
 /*
- * Structure of stack frame of fucntion call which resulted from analyze of query state
- */
-typedef struct
-{
-	const char	*query;
-	char		*plan;
-} stack_frame;
-
-/*
- *	Get List of stack_frames as a stack of function calls starting from outermost call.
- *		Each entry contains query text and query state in form of EXPLAIN ANALYZE output.
+ *	Get List of `stack_frame`s as a stack of function calls starting from
+ *	outermost call. Each entry contains query text and query state in form of
+ *	EXPLAIN ANALYZE output.
+ *
  *	Assume extension is enabled and QueryDescStack is not empty
  */
 static List *
@@ -1228,7 +1247,7 @@ runtime_explain()
 	foreach(i, QueryDescStack)
 	{
 		QueryDesc 	*currentQueryDesc = (QueryDesc *) lfirst(i);
-		stack_frame	*qs_frame = palloc(sizeof(stack_frame));
+		StackFrame	*qs_frame = palloc(sizeof(StackFrame));
 
 		/* save query text */
 		qs_frame->query = currentQueryDesc->sourceText;
@@ -1264,7 +1283,7 @@ runtime_explain()
  * Compute length of serialized stack frame
  */
 static int
-serialized_stack_frame_length(stack_frame *qs_frame)
+serialized_stack_frame_length(StackFrame *qs_frame)
 {
 	return 	INTALIGN(strlen(qs_frame->query) + VARHDRSZ)
 		+ 	INTALIGN(strlen(qs_frame->plan) + VARHDRSZ);
@@ -1281,7 +1300,7 @@ serialized_stack_length(List *qs_stack)
 
 	foreach(i, qs_stack)
 	{
-		stack_frame *qs_frame = (stack_frame *) lfirst(i);
+		StackFrame *qs_frame = (StackFrame *) lfirst(i);
 
 		result += serialized_stack_frame_length(qs_frame);
 	}
@@ -1290,11 +1309,11 @@ serialized_stack_length(List *qs_stack)
 }
 
 /*
- * Convert stack_frame record into serialized text format version
+ * Convert StackFrame record into serialized text format version
  * 		Increment '*dest' pointer to the next serialized stack frame
  */
 static void
-serialize_stack_frame(char **dest, stack_frame *qs_frame)
+serialize_stack_frame(char **dest, StackFrame *qs_frame)
 {
 	SET_VARSIZE(*dest, strlen(qs_frame->query) + VARHDRSZ);
 	memcpy(VARDATA(*dest), qs_frame->query, strlen(qs_frame->query));
@@ -1306,7 +1325,7 @@ serialize_stack_frame(char **dest, stack_frame *qs_frame)
 }
 
 /*
- * Convert List of stack_frame records into serialized structures laid out sequentially
+ * Convert List of StackFrame records into serialized structures laid out sequentially
  */
 static void
 serialize_stack(char *dest, List *qs_stack)
@@ -1315,9 +1334,55 @@ serialize_stack(char *dest, List *qs_stack)
 
 	foreach(i, qs_stack)
 	{
-		stack_frame *qs_frame = (stack_frame *) lfirst(i);
+		StackFrame *qs_frame = (StackFrame *) lfirst(i);
 
 		serialize_stack_frame(&dest, qs_frame);
+	}
+}
+
+/*
+ * Extract to *result all handlers of parallel workers running from leader
+ * process that executes plan tree whose state's root is `node`.
+ */
+static bool
+extract_pworkers(PlanState *node, List **result)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, GatherState))
+	{
+		GatherState *gather_node = (GatherState *) node;
+
+		if (gather_node->pei)
+		{
+			int i;
+
+			for (i = 0; i < gather_node->pei->pcxt->nworkers_launched; i++)
+			{
+				BackgroundWorkerHandle 	*bgwh;
+
+				bgwh = gather_node->pei->pcxt->worker[i].bgwhandle;
+				if (bgwh)
+					*result = lcons(bgwh, *result);
+			}
+		}
+	}
+	return planstate_tree_walker(node, extract_pworkers, (void *) result);
+}
+
+static void
+mq_wait_turn()
+{
+	/* wait until caller sets this process as sender to message queue */
+	for (;;)
+	{
+		if (shm_mq_get_sender(mq) == MyProc)
+			break;
+
+		WaitLatch(MyLatch, WL_LATCH_SET, 0);
+		CHECK_FOR_INTERRUPTS();
+		ResetLatch(MyLatch);
 	}
 }
 
@@ -1329,55 +1394,104 @@ void
 SendQueryState(void)
 {
 	shm_mq_handle 	*mqh;
-
-	/* wait until caller sets this process as sender to message queue */
-	for (;;)
-	{
-		if (shm_mq_get_sender(mq) == MyProc)
-			break;
-
-		WaitLatch(MyLatch, WL_LATCH_SET, 0);
-		CHECK_FOR_INTERRUPTS();
-		ResetLatch(MyLatch);
-	}
-
-	mqh = shm_mq_attach(mq, NULL, NULL);
+	List			*all_pworkers;
+	List			*alived_pworkers;
+	ListCell		*iter;
+	pgqsPreambleMsg	*preamble;
+	pgqsStackMsg	*stack_msg;
+	Size			 msg_len;
+	List			*qs_stack;
+	int				 i;
 
 	/* check if module is enabled */
 	if (!pg_qs_enable)
 	{
-		shm_mq_msg msg = { BASE_SIZEOF_SHM_MQ_MSG, MyProc, STAT_DISABLED };
+		pgqsPreambleMsg msg;
 
-		shm_mq_send(mqh, msg.length, &msg, false);
+		msg_len = offsetof(pgqsPreambleMsg, warnings);
+		msg = (pgqsPreambleMsg) { STAT_DISABLED };
+
+		mq_wait_turn();
+		mqh = shm_mq_attach(mq, NULL, NULL);
+		shm_mq_send(mqh, msg_len, &msg, false);
+		return;
 	}
 
 	/* check if backend doesn't execute any query */
 	else if (list_length(QueryDescStack) == 0)
 	{
-		shm_mq_msg msg = { BASE_SIZEOF_SHM_MQ_MSG, MyProc, QUERY_NOT_RUNNING };
+		pgqsPreambleMsg msg;
 
-		shm_mq_send(mqh, msg.length, &msg, false);
+		msg_len = offsetof(pgqsPreambleMsg, warnings);
+		msg = (pgqsPreambleMsg) { QUERY_NOT_RUNNING };
+
+		mq_wait_turn();
+		mqh = shm_mq_attach(mq, NULL, NULL);
+		shm_mq_send(mqh, msg_len, &msg, false);
+		return;
 	}
 
 	/* happy path */
-	else
+	extract_pworkers(((QueryDesc *) llast(QueryDescStack))->planstate,
+					 &all_pworkers);
+	alived_pworkers = NIL;
+	foreach(iter, all_pworkers)
 	{
-		List			*qs_stack = runtime_explain();
-		int				msglen = sizeof(shm_mq_msg) + serialized_stack_length(qs_stack);
-		shm_mq_msg		*msg = palloc(msglen);
+		pid_t	 pid;
+		PGPROC	*proc;
+		BackgroundWorkerHandle *bgwh = (BackgroundWorkerHandle *) lfirst(iter);
+		BgwHandleStatus			status;
+		int		 sig_result;
 
-		msg->length = msglen;
-		msg->proc = MyProc;
-		msg->result_code = QS_RETURNED;
+		status = GetBackgroundWorkerPid(bgwh, &pid);
+		if (status != BGWH_STARTED)
+			continue;
 
-		msg->warnings = 0;
-		if (params->timing && !pg_qs_timing)
-			msg->warnings |= TIMINIG_OFF_WARNING;
-		if (params->buffers && !pg_qs_buffers)
-			msg->warnings |= BUFFERS_OFF_WARNING;
+		proc = BackendPidGetProc(pid);
+		sig_result = SendProcSignal(pid,
+									QueryStatePollReason,
+									proc->backendId);
+		if (sig_result == -1)
+		{
+			if (errno != ESRCH)
+				goto signal_error;
+			continue;
+		}
 
-		msg->stack_depth = list_length(qs_stack);
-		serialize_stack(msg->stack, qs_stack);
-		shm_mq_send(mqh, msglen, msg, false);
+		alived_pworkers = lappend(alived_pworkers, proc);
 	}
+
+	msg_len = offsetof(pgqsPreambleMsg, pworkers)
+				+ INTALIGN(sizeof(PGPROC *)) * list_length(alived_pworkers);
+	preamble = palloc(msg_len);
+	preamble->result = QS_RETURNED;
+	preamble->warnings = 0;
+	if (params->timing && !pg_qs_timing)
+		preamble->warnings |= TIMINIG_OFF_WARNING;
+	if (params->buffers && !pg_qs_buffers)
+		preamble->warnings |= BUFFERS_OFF_WARNING;
+	preamble->npworkers = list_length(alived_pworkers);
+	i = 0;
+	foreach(iter, alived_pworkers)
+	{
+		PGPROC *proc = (PGPROC *) lfirst(iter);
+
+		preamble->pworkers[i++] = proc;
+	}
+
+	mq_wait_turn();
+	mqh = shm_mq_attach(mq, NULL, NULL);
+	shm_mq_send(mqh, msg_len, preamble, false);
+
+	qs_stack = runtime_explain();
+	msg_len = serialized_stack_length(qs_stack);
+	stack_msg = palloc(msg_len);
+	stack_msg->length = msg_len;
+	stack_msg->nframes = list_length(qs_stack);
+	serialize_stack(stack_msg->stack, qs_stack);
+	shm_mq_send(mqh, msg_len, stack_msg, false);
+
+signal_error:
+	ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+				errmsg("invalid send signal")));
 }
